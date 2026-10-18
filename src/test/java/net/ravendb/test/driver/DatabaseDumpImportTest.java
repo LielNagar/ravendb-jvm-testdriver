@@ -9,8 +9,12 @@ import net.ravendb.client.documents.smuggler.DatabaseSmugglerExportOptions;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Covers the getDatabaseDumpFilePath() path end to end: a dump is produced from one test
@@ -49,6 +53,27 @@ public class DatabaseDumpImportTest extends RavenTestDriver {
         }
     }
 
+    @Test
+    public void dumpStreamIsImportedAndClosedWithTheDriver() throws Exception {
+        File dumpFile = createDump();
+
+        try (InputStream stream = new FileInputStream(dumpFile)) {
+            StreamDumpDriver driver = new StreamDumpDriver(stream);
+
+            try (IDocumentStore store = driver.openStore();
+                 IDocumentSession session = store.openSession()) {
+                assertThat(session.load(BasicTest.Person.class, "people/" + NUMBER_OF_DOCUMENTS))
+                        .isNotNull();
+            }
+
+            driver.close();
+
+            assertThatThrownBy(stream::read)
+                    .as("the driver must close the dump stream it was given")
+                    .isInstanceOf(IOException.class);
+        }
+    }
+
     private File createDump() throws Exception {
         File dumpFile = File.createTempFile("test-driver-dump-", ".ravendbdump");
         dumpFile.deleteOnExit();
@@ -69,6 +94,24 @@ public class DatabaseDumpImportTest extends RavenTestDriver {
         }
 
         return dumpFile;
+    }
+
+    private static class StreamDumpDriver extends RavenTestDriver {
+
+        private final InputStream stream;
+
+        StreamDumpDriver(InputStream stream) {
+            this.stream = stream;
+        }
+
+        IDocumentStore openStore() {
+            return getDocumentStore("streamDumpTarget");
+        }
+
+        @Override
+        protected InputStream getDatabaseDumpFileStream() {
+            return stream;
+        }
     }
 
     private static class DumpDriver extends RavenTestDriver {

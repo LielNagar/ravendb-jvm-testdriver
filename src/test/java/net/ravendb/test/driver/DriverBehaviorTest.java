@@ -7,9 +7,11 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.management.ManagementFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 public class DriverBehaviorTest extends RavenTestDriver {
@@ -77,6 +79,42 @@ public class DriverBehaviorTest extends RavenTestDriver {
         }
     }
 
+    @Test
+    public void databaseCreatedFromAConstructorIsNamedAfterTheType() {
+        try (CtorDriver driver = new CtorDriver()) {
+            assertThat(driver.store.getDatabase())
+                    .startsWith("CtorDriver_ctor_");
+        }
+    }
+
+    @Test
+    public void syntheticCallerNamesAreSanitized() {
+        Supplier<IDocumentStore> fromLambda = () -> getDocumentStore();
+
+        try (IDocumentStore store = fromLambda.get()) {
+            assertThat(store.getDatabase())
+                    .startsWith("lambda_")
+                    .doesNotContain("$");
+        }
+    }
+
+    @Test
+    public void databaseNamesAreUnique() {
+        try (IDocumentStore first = getDocumentStore("same");
+             IDocumentStore second = getDocumentStore("same")) {
+            assertThat(first.getDatabase()).isNotEqualTo(second.getDatabase());
+        }
+    }
+
+    @Test
+    public void serverCannotBeConfiguredAfterItStarted() {
+        getDocumentStore().close();
+
+        assertThatThrownBy(() -> configureServer(new TestServerOptions()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("configureServer");
+    }
+
     private static boolean isDebugAgentPresent() {
         for (String argument : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
             if (argument.startsWith("-agentlib:jdwp") || argument.startsWith("-Xrunjdwp")) {
@@ -85,6 +123,15 @@ public class DriverBehaviorTest extends RavenTestDriver {
         }
 
         return false;
+    }
+
+    private static class CtorDriver extends RavenTestDriver {
+
+        final IDocumentStore store;
+
+        CtorDriver() {
+            store = getDocumentStore();
+        }
     }
 
     private static class SettingsDriver extends RavenTestDriver {
