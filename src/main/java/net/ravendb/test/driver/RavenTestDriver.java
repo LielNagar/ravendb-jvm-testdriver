@@ -5,7 +5,6 @@ import com.google.common.io.Files;
 import net.ravendb.client.Constants;
 import net.ravendb.client.documents.DocumentStore;
 import net.ravendb.client.documents.IDocumentStore;
-import net.ravendb.client.documents.Lazy;
 import net.ravendb.client.documents.indexes.IndexErrors;
 import net.ravendb.client.documents.indexes.IndexState;
 import net.ravendb.client.documents.operations.DatabaseStatistics;
@@ -22,7 +21,10 @@ import net.ravendb.client.exceptions.cluster.NoLeaderException;
 import net.ravendb.client.exceptions.database.DatabaseDoesNotExistException;
 import net.ravendb.client.http.RequestExecutor;
 import net.ravendb.client.primitives.CleanCloseable;
+import net.ravendb.client.primitives.EventArgs;
+import net.ravendb.client.primitives.EventHandler;
 import net.ravendb.client.primitives.EventHelper;
+import net.ravendb.client.primitives.VoidArgs;
 import net.ravendb.client.serverwide.DatabaseRecord;
 import net.ravendb.client.serverwide.operations.CreateDatabaseOperation;
 import net.ravendb.client.serverwide.operations.DeleteDatabasesOperation;
@@ -32,7 +34,6 @@ import net.ravendb.embedded.EmbeddedServer;
 import net.ravendb.embedded.ServerOptions;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.ObjectUtils;
-import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.routing.DefaultProxyRoutePlanner;
 import org.apache.hc.core5.http.HttpHost;
 
@@ -57,13 +58,16 @@ import java.util.stream.Collectors;
 public class RavenTestDriver implements CleanCloseable {
     private static final EmbeddedServer TEST_SERVER = new EmbeddedServer();
 
-    private static final Lazy<IDocumentStore> TEST_SERVER_STORE = new Lazy<>(() -> runServer());
+    private static final FailureCachingLazy<IDocumentStore> TEST_SERVER_STORE = new FailureCachingLazy<>(() -> runServer());
 
     private final ConcurrentMap<DocumentStore, Boolean> _documentStores = new ConcurrentHashMap<>();
 
     private static AtomicInteger _index = new AtomicInteger(0);
     private static ServerOptions _globalServerOptions;
-    private static volatile RuntimeException _serverStartupFailure;
+
+    private EmbeddedServer _scopedServer;
+    private ServerOptions _scopedServerOptions;
+    private final FailureCachingLazy<IDocumentStore> _scopedDocumentStore = new FailureCachingLazy<>(() -> createScopedDocumentStore());
 
     private static File _emptySettingsFile;
 
@@ -84,17 +88,89 @@ public class RavenTestDriver implements CleanCloseable {
         return null;
     }
 
+    private boolean _disposed;
+
+    /**
+     * @deprecated use {@link #isDisposed()}. Kept in sync for subclasses that read it, but setting it no
+     * longer has any effect - like C#'s {@code IsDisposed}, the disposed state can only be changed by
+     * {@link #close()}.
+     */
+    @Deprecated
     protected boolean disposed;
 
-    private static Supplier<ServerOptions> serverOptions = () -> defaultServerOptions();
+    protected boolean isDisposed() {
+        return _disposed;
+    }
 
+    private static Supplier<TestServerOptions> serverOptions = () -> defaultServerOptions();
+
+    public static void configureServer(TestServerOptions options) {
+        configureServerInternal(options);
+    }
+
+    /**
+     * @param options options for the global server
+     * @deprecated use {@link #configureServer(TestServerOptions)}. Plain {@link ServerOptions} do not enforce a
+     * valid license, so a test server configured this way silently starts unlicensed. This overload will be
+     * removed in the next major version, mirroring the C# test driver.
+     */
+    @Deprecated
     public static void configureServer(ServerOptions options) {
+        configureServerInternal(options);
+    }
+
+    private static void configureServerInternal(ServerOptions options) {
         if (TEST_SERVER_STORE.isValueCreated()) {
             throw new IllegalStateException("Cannot configure server after it was started. " +
                     "Please call 'configureServer' method before any 'getDocumentStore' is called.");
         }
 
         _globalServerOptions = options;
+    }
+
+    /**
+     * Runs this driver instance against its own embedded server instead of the JVM-wide one, so a
+     * test class can use its own server configuration without affecting every other test.
+     * <p>
+     * Package-private on purpose: it mirrors an {@code internal} C# member, and the repository's
+     * own tests live in this package.
+     *
+     * @param options options for the scoped server
+     * @return handle that shuts the scoped server down and returns this driver to the global one
+     */
+    CleanCloseable configureScopedServer(TestServerOptions options) {
+        return configureScopedServer(options, null);
+    }
+
+    /**
+     * @param options options for the scoped server
+     * @param server  server to use, or null to create one
+     * @return handle that shuts the scoped server down and returns this driver to the global one
+     */
+    CleanCloseable configureScopedServer(TestServerOptions options, EmbeddedServer server) {
+        if (_scopedServer != null) {
+            throw new IllegalStateException("Local embedded server is already set.");
+        }
+
+        if (_scopedDocumentStore.isValueCreated()) {
+            throw new IllegalStateException("Cannot set embedded server after document store has been initialized.");
+        }
+
+        _scopedServer = server != null ? server : new EmbeddedServer();
+        _scopedServerOptions = options;
+
+        return () -> {
+            try {
+                if (_scopedServer != null) {
+                    _scopedServer.close();
+                }
+            } catch (Exception e) {
+                // swallow exceptions
+            } finally {
+                _scopedServer = null;
+                _scopedServerOptions = null;
+            }
+        };
     }
 
     protected IDocumentStore getDocumentStore() {
@@ -115,7 +191,9 @@ public class RavenTestDriver implements CleanCloseable {
         }
         options = ObjectUtils.firstNonNull(options, GetDocumentStoreOptions.getDefault());
         String name = database + "_" + _index.incrementAndGet();
-        IDocumentStore documentStore = TEST_SERVER_STORE.getValue();
+        IDocumentStore documentStore = _scopedServer != null
+                ? _scopedDocumentStore.getValue()
+                : TEST_SERVER_STORE.getValue();
 
         DatabaseRecord databaseRecord = new DatabaseRecord(name);
 
@@ -152,7 +230,7 @@ public class RavenTestDriver implements CleanCloseable {
         setupDatabase(store);
 
         if (options.getWaitForIndexingTimeout() != null) {
-            waitForIndexing(store, name, options.getWaitForIndexingTimeout());
+            waitForIndexingInternal(store, name, options.getWaitForIndexingTimeout());
         }
 
         _documentStores.put(store, true);
@@ -219,41 +297,65 @@ public class RavenTestDriver implements CleanCloseable {
         // empty by design
     }
 
+    /**
+     * @deprecated use {@link #addDriverClosedListener(EventHandler)}, which mirrors the C# DriverDisposed
+     * event and supports any number of listeners. This field will be removed in the next major version.
+     */
+    @Deprecated
     protected Consumer<RavenTestDriver> onDriverClosed = (driver) -> {};
 
-    private final List<Consumer<RavenTestDriver>> onDriverClosedListeners = new ArrayList<>();
+    private final List<EventHandler<VoidArgs>> onDriverClosedListeners = new ArrayList<>();
 
     /**
-     * Registers a listener notified when this driver is closed. Unlike the single assignable
-     * {@link #onDriverClosed} field, any number of listeners can be registered - this is the
-     * equivalent of the multicast DriverDisposed event on the C# side.
+     * Registers a listener notified, with this driver as the sender, once the driver is closed -
+     * the equivalent of the C# DriverDisposed event.
      * @param listener listener to add
      */
-    public void addDriverClosedListener(Consumer<RavenTestDriver> listener) {
+    protected void addDriverClosedListener(EventHandler<VoidArgs> listener) {
         onDriverClosedListeners.add(listener);
     }
 
     /**
      * @param listener listener to remove
      */
-    public void removeDriverClosedListener(Consumer<RavenTestDriver> listener) {
+    protected void removeDriverClosedListener(EventHandler<VoidArgs> listener) {
         onDriverClosedListeners.remove(listener);
     }
 
-    public boolean isDisposed() {
-        return disposed;
-    }
-
-
+    /**
+     * @param store store to wait on
+     * @deprecated In the next major version this becomes a {@code protected} instance method, mirroring the
+     * C# test driver. Calls made from a {@link RavenTestDriver} subclass ({@code waitForIndexing(store)})
+     * will keep compiling unchanged; calls through the class from elsewhere
+     * ({@code RavenTestDriver.waitForIndexing(store)}) will not.
+     */
+    @Deprecated
     public static void waitForIndexing(IDocumentStore store) {
-        waitForIndexing(store, null, null);
+        waitForIndexingInternal(store, null, null);
     }
 
+    /**
+     * @param store    store to wait on
+     * @param database database to wait on, or null for the store's database
+     * @deprecated see {@link #waitForIndexing(IDocumentStore)}.
+     */
+    @Deprecated
     public static void waitForIndexing(IDocumentStore store, String database) {
-        waitForIndexing(store, database, null);
+        waitForIndexingInternal(store, database, null);
     }
 
+    /**
+     * @param store    store to wait on
+     * @param database database to wait on, or null for the store's database
+     * @param timeout  how long to wait, or null for one minute
+     * @deprecated see {@link #waitForIndexing(IDocumentStore)}.
+     */
+    @Deprecated
     public static void waitForIndexing(IDocumentStore store, String database, Duration timeout) {
+        waitForIndexingInternal(store, database, timeout);
+    }
+
+    private static void waitForIndexingInternal(IDocumentStore store, String database, Duration timeout) {
         MaintenanceOperationExecutor admin = store.maintenance().forDatabase(database);
 
         if (timeout == null) {
@@ -281,6 +383,7 @@ public class RavenTestDriver implements CleanCloseable {
             try {
                 Thread.sleep(100);
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
             }
         }
@@ -291,8 +394,8 @@ public class RavenTestDriver implements CleanCloseable {
         if (errors != null && errors.length > 0) {
             String allIndexErrorsListText = Arrays.stream(errors)
                     .map(RavenTestDriver::formatIndexErrors)
-                    .collect(Collectors.joining(System.lineSeparator()));
-            allIndexErrorsText = "Indexing errors:" + System.lineSeparator() + allIndexErrorsListText;
+                    .collect(Collectors.joining("\r\n"));
+            allIndexErrorsText = "Indexing errors:\r\n" + allIndexErrorsListText;
         }
 
         throw new TimeoutException("The indexes stayed stale for more than " + timeout + "." + allIndexErrorsText);
@@ -301,10 +404,9 @@ public class RavenTestDriver implements CleanCloseable {
     private static String formatIndexErrors(IndexErrors indexErrors) {
         String errorsListText = Arrays.stream(indexErrors.getErrors())
                 .map(x -> "- " + x)
-                .collect(Collectors.joining(System.lineSeparator()));
+                .collect(Collectors.joining("\r\n"));
 
-        return "Index '" + indexErrors.getName() + "' (" + indexErrors.getErrors().length + " errors):"
-                + System.lineSeparator() + errorsListText;
+        return "Index '" + indexErrors.getName() + "' (" + indexErrors.getErrors().length + " errors):\r\n" + errorsListText;
     }
 
     protected void waitForUserToContinueTheTest(IDocumentStore store) {
@@ -378,7 +480,7 @@ public class RavenTestDriver implements CleanCloseable {
 
     @Override
     public void close() {
-        if (disposed) {
+        if (_disposed) {
             return;
         }
 
@@ -387,6 +489,22 @@ public class RavenTestDriver implements CleanCloseable {
         for (DocumentStore documentStore : _documentStores.keySet()) {
             try {
                 documentStore.close();
+            } catch (Exception e) {
+                exceptions.add(e);
+            }
+        }
+
+        if (_scopedServer != null && _scopedDocumentStore.isValueCreated()) {
+            try {
+                _scopedDocumentStore.getValue().close();
+            } catch (Exception e) {
+                exceptions.add(e);
+            }
+        }
+
+        if (_scopedServer != null) {
+            try {
+                _scopedServer.close();
             } catch (Exception e) {
                 exceptions.add(e);
             }
@@ -401,13 +519,14 @@ public class RavenTestDriver implements CleanCloseable {
             }
         }
 
+        _disposed = true;
         disposed = true;
 
         if (onDriverClosed != null) {
             onDriverClosed.accept(this);
         }
 
-        EventHelper.invoke(onDriverClosedListeners, this);
+        EventHelper.invoke(new ArrayList<>(onDriverClosedListeners), this, EventArgs.EMPTY);
 
         if (exceptions.size() > 0) {
             throw aggregate(exceptions);
@@ -449,8 +568,8 @@ public class RavenTestDriver implements CleanCloseable {
         }
     }
 
-    private static ServerOptions defaultServerOptions() {
-        ServerOptions options = new ServerOptions();
+    private static TestServerOptions defaultServerOptions() {
+        TestServerOptions options = new TestServerOptions();
 
         File serverDir = Files.createTempDir();
         serverDir.deleteOnExit();
@@ -486,42 +605,46 @@ public class RavenTestDriver implements CleanCloseable {
     }
 
     private static IDocumentStore runServer() {
-        // the client's Lazy only remembers successful values, so without this a failed startup
-        // would be retried by every test - re-inserting the test arguments into the same options
-        // and hiding the root cause behind 'The server was already started'
-        RuntimeException startupFailure = _serverStartupFailure;
-        if (startupFailure != null) {
-            throw new RavenException("Unable to start server: " + startupFailure.getMessage(), startupFailure);
-        }
-
-        try {
-            ServerOptions options = ObjectUtils.firstNonNull(_globalServerOptions, serverOptions.get());
-
-            List<String> commandLineArgs = new ArrayList<>();
-            commandLineArgs.add("-c");
-            commandLineArgs.add(CommandLineArgumentEscaper.escapeSingleArg(getEmptySettingsFile().getAbsolutePath()));
-            commandLineArgs.addAll(options.getCommandLineArgs());
-            commandLineArgs.add("--RunInMemory=true");
-            options.setCommandLineArgs(commandLineArgs);
-
-            TEST_SERVER.startServer(options);
-
-            String url = TEST_SERVER.getServerUri();
-
-            DocumentStore store = new DocumentStore(url, null);
-
-            store.initialize();
-
-            return store;
-        } catch (IOException e) {
-            _serverStartupFailure = new RavenException("Unable to start server: " + e.getMessage(), e);
-            throw _serverStartupFailure;
-        } catch (RuntimeException e) {
-            _serverStartupFailure = e;
-            throw e;
-        }
+        return startAndConnect(TEST_SERVER, ObjectUtils.firstNonNull(_globalServerOptions, serverOptions.get()));
     }
 
+    private IDocumentStore createScopedDocumentStore() {
+        return startAndConnect(_scopedServer,
+                ObjectUtils.firstNonNull(_scopedServerOptions, _globalServerOptions, serverOptions.get()));
+    }
+
+    /**
+     * Starts an embedded server with the settings every test server needs - isolated from the
+     * shipped settings.json and running in memory - and connects a store to it.
+     */
+    private static IDocumentStore startAndConnect(EmbeddedServer server, ServerOptions options) {
+        List<String> commandLineArgs = new ArrayList<>();
+        commandLineArgs.add("-c");
+        try {
+            commandLineArgs.add(CommandLineArgumentEscaper.escapeSingleArg(getEmptySettingsFile().getAbsolutePath()));
+        } catch (IOException e) {
+            throw new RavenException("Unable to start server: " + e.getMessage(), e);
+        }
+        commandLineArgs.addAll(options.getCommandLineArgs());
+        commandLineArgs.add("--RunInMemory=true");
+        options.setCommandLineArgs(commandLineArgs);
+
+        server.startServer(options);
+
+        DocumentStore store = new DocumentStore(server.getServerUri(), null);
+
+        store.initialize();
+
+        return store;
+    }
+
+    /**
+     * @deprecated use {@link TestServerOptions#useFiddler()}, which mirrors the C# test driver: it makes the
+     * server reachable through the machine name, so Fiddler captures its traffic without any client
+     * configuration. This method instead replaces the process-wide {@link RequestExecutor#configureHttpClient}
+     * and will be removed in the next major version.
+     */
+    @Deprecated
     public void withFiddler() {
         RequestExecutor.configureHttpClient = builder -> {
             HttpHost proxy = new HttpHost("http", "127.0.0.1", 8888);

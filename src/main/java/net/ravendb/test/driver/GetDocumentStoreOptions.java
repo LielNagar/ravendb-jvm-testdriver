@@ -5,7 +5,7 @@ import net.ravendb.client.documents.Lazy;
 import java.time.Duration;
 
 @SuppressWarnings({"WeakerAccess", "unused"})
-public class GetDocumentStoreOptions {
+public final class GetDocumentStoreOptions {
     private static final Lazy<GetDocumentStoreOptions> DEFAULT = new Lazy<>(() -> new GetDocumentStoreOptions());
 
     static GetDocumentStoreOptions getDefault() {
